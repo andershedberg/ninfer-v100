@@ -16,7 +16,8 @@ namespace {
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kQHeads  = 32;
 constexpr std::int32_t kKVHeads = 8;
-constexpr std::int32_t kWindow  = 4096;
+constexpr std::int32_t kWindowLocal = 2048;
+constexpr std::int32_t kWindowFull  = 4096;
 constexpr float kExpectedScale  = 0.08838834764831844055f;
 
 void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const char* op) {
@@ -24,8 +25,9 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
         geometry.query_heads != kQHeads || geometry.kv_heads != kKVHeads) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
-    if (window != static_cast<std::uint32_t>(kWindow)) {
-        throw std::invalid_argument(std::string(op) + ": supported window is 4096");
+    if (window != static_cast<std::uint32_t>(kWindowLocal) &&
+        window != static_cast<std::uint32_t>(kWindowFull)) {
+        throw std::invalid_argument(std::string(op) + ": supported window is 2048 or 4096");
     }
 }
 
@@ -45,9 +47,10 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
-void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
+void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t window,
+                      const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        context.capacity != window || context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
@@ -75,7 +78,11 @@ template <class Allocator>
 PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens, std::int32_t splits,
                                     std::int32_t batch_size) {
     return {
+#ifdef NINFER_VOLTA_BUILD
+        workspace.alloc(DType::FP32, {kHeadDim, kQHeads, tokens, splits * batch_size}),
+#else
         workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits * batch_size}),
+#endif
         workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
     };
@@ -141,7 +148,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     require_contiguous_nonnull(valid_columns, op, "valid columns");
     require_contiguous_nonnull(lanes, op, "lanes");
     require_contiguous_nonnull(out, op, "out");
-    validate_context(context, op);
+    validate_context(context, window, op);
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
